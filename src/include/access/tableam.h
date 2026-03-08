@@ -21,6 +21,7 @@
 #include "access/sdir.h"
 #include "access/xact.h"
 #include "commands/vacuum.h"
+#include "executor/execBatch.h"
 #include "executor/tuptable.h"
 #include "storage/read_stream.h"
 #include "utils/rel.h"
@@ -39,6 +40,7 @@ typedef struct BulkInsertStateData BulkInsertStateData;
 typedef struct IndexInfo IndexInfo;
 typedef struct SampleScanState SampleScanState;
 typedef struct ValidateIndexState ValidateIndexState;
+typedef struct TupleBatchOps TupleBatchOps;
 
 /*
  * Bitmask values for the flags argument to the scan_begin callback.
@@ -301,6 +303,7 @@ typedef struct TableAmRoutine
 	 * Return slot implementation suitable for storing a tuple of this AM.
 	 */
 	const TupleTableSlotOps *(*slot_callbacks) (Relation rel);
+	const TupleBatchOps *(*batch_callbacks)(Relation rel);
 
 
 	/* ------------------------------------------------------------------------
@@ -350,6 +353,17 @@ typedef struct TableAmRoutine
 	bool		(*scan_getnextslot) (TableScanDesc scan,
 									 ScanDirection direction,
 									 TupleTableSlot *slot);
+
+	/* ------------------------------------------------------------------------
+	 * Batched scan support
+	 * ------------------------------------------------------------------------
+	 */
+
+	void	   *(*scan_begin_batch)(TableScanDesc sscan, int maxitems);
+	int			(*scan_getnextbatch)(TableScanDesc sscan, void *am_batch,
+									 ScanDirection dir);
+	void		(*scan_end_batch)(TableScanDesc sscan, void *am_batch);
+
 
 	/*-----------
 	 * Optional functions to provide scanning for ranges of ItemPointers.
@@ -862,6 +876,16 @@ extern const TupleTableSlotOps *table_slot_callbacks(Relation relation);
  */
 extern TupleTableSlot *table_slot_create(Relation relation, List **reglist);
 
+/* ----------------------------------------------------------------------------
+ * TupleBatch functions.
+ * ----------------------------------------------------------------------------
+ */
+
+/*
+ * Returns callbacks for manipulating TupleBatch for tuples of the given
+ * relation.
+ */
+extern const TupleBatchOps *table_batch_callbacks(Relation relation);
 
 /* ----------------------------------------------------------------------------
  * Table scan functions.
@@ -1034,6 +1058,66 @@ table_scan_getnextslot(TableScanDesc sscan, ScanDirection direction, TupleTableS
 		elog(ERROR, "unexpected table_scan_getnextslot call during logical decoding");
 
 	return sscan->rs_rd->rd_tableam->scan_getnextslot(sscan, direction, slot);
+}
+
+/*
+ * table_supports_batching
+ *		Does the relation's AM support batching?
+ */
+static inline bool
+table_supports_batching(Relation relation)
+{
+	const TableAmRoutine *tam = relation->rd_tableam;
+
+	return tam->scan_getnextbatch != NULL;
+}
+
+/*
+ * table_scan_begin_batch
+ *		Allocate AM-owned batch payload with capacity 'maxitems'.
+ */
+static inline void *
+table_scan_begin_batch(TableScanDesc sscan, int maxitems)
+{
+	const TableAmRoutine *tam = sscan->rs_rd->rd_tableam;
+
+	Assert(tam->scan_begin_batch != NULL);
+
+	return tam->scan_begin_batch(sscan, maxitems);
+}
+
+/*
+ * table_scan_getnextbatch
+ *		Fill next batch from the AM. Returns number of tuples, 0 => EOS.
+ *		Batches are single-page in v1. Direction is forward only in v1.
+ */
+static inline int
+table_scan_getnextbatch(TableScanDesc sscan, void *am_batch, ScanDirection dir)
+{
+	const TableAmRoutine *tam = sscan->rs_rd->rd_tableam;
+
+	/* Only forward scans are supported in the batched mode. */
+	Assert(dir == ForwardScanDirection);
+	Assert(tam->scan_getnextbatch != NULL);
+
+	return tam->scan_getnextbatch(sscan, am_batch, dir);
+}
+
+/*
+ * table_scan_end_batch
+ *		Release AM-owned resources for the batch payload.
+ */
+static inline void
+table_scan_end_batch(TableScanDesc sscan, void *am_batch)
+{
+	const TableAmRoutine *tam = sscan->rs_rd->rd_tableam;
+
+	if (am_batch == NULL)
+		return;
+
+	Assert(tam->scan_end_batch != NULL);
+
+	tam->scan_end_batch(sscan, am_batch);
 }
 
 /* ----------------------------------------------------------------------------
@@ -2058,5 +2142,6 @@ extern const TableAmRoutine *GetTableAmRoutine(Oid amhandler);
  */
 
 extern const TableAmRoutine *GetHeapamTableAmRoutine(void);
+extern struct TupleBatchOps *GetHeapamTupleBatchOps(void);
 
 #endif							/* TABLEAM_H */
