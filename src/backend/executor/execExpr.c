@@ -47,6 +47,7 @@
 #include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/jsonfuncs.h"
 #include "utils/jsonpath.h"
 #include "utils/lsyscache.h"
@@ -95,7 +96,9 @@ static void ExecBuildAggTransCall(ExprState *state, AggState *aggstate,
 								  ExprEvalStep *scratch,
 								  FunctionCallInfo fcinfo, AggStatePerTrans pertrans,
 								  int transno, int setno, int setoff, bool ishash,
-								  bool nullcheck);
+								  bool nullcheck, bool batch,
+								  BatchVector *bv);
+
 static void ExecInitJsonExpr(JsonExpr *jsexpr, ExprState *state,
 							 Datum *resv, bool *resnull,
 							 ExprEvalStep *scratch);
@@ -104,6 +107,10 @@ static void ExecInitJsonCoercion(ExprState *state, JsonReturning *returning,
 								 bool exists_coerce,
 								 Datum *resv, bool *resnull);
 
+static BatchVector *BatchVectorCreate(Bitmapset *attnos, AttrNumber last_var);
+static bool ExprListAllSimpleVars(const List *args, Bitmapset **allattnos);
+static BatchVectorSlice *BatchVectorSliceFromExprArgs(const List *args,
+													  const BatchVector *bv);
 
 /*
  * ExecInitExpr: prepare an expression tree for execution
@@ -3659,6 +3666,55 @@ ExecInitCoerceToDomain(ExprEvalStep *scratch, CoerceToDomain *ctest,
 	}
 }
 
+/* plain agg, single set, not hashed, no DISTINCT/ORDER/FILTER */
+static inline bool
+AggTransCanUseBatch(AggState *as, AggStatePerTrans pt)
+{
+	Agg *aggnode = (Agg *) as->ss.ps.plan;
+
+	if (!AggCanUsePlainBatch(as))
+		return false;
+	if (as->aggstrategy == AGG_HASHED)
+		return false;
+	if (aggnode->groupingSets != NIL)
+		return false;
+	if (as->phase == NULL || as->phase->numsets > 0)
+		return false;
+
+	/* per-aggregate complications */
+	if (pt->aggsortrequired)
+		return false;
+	if (pt->aggref &&
+		(pt->aggref->aggdistinct != NIL ||
+		 pt->aggref->aggorder != NIL ||
+		 pt->aggref->aggfilter != NULL))
+		return false;
+
+	return true;
+}
+
+/* Return true if this transfn OID is known to accept AggBulkArgs. */
+static bool
+AggTransfnSupportsBulk(Oid fn_oid)
+{
+	/* Phase 1: hard-coded allowlist of built-ins you updated. */
+	static const Oid ok[] =
+	{
+		F_INT8INC_ANY,		/* COUNT(*) transfn */
+		F_INT8INC,			/* COUNT(arg) transfn */
+		F_INT4_SUM,			/* SUM(int) transfn */
+		F_INT4SMALLER,		/* MIN(int) transfn */
+		F_INT4LARGER,		/* MAX(int) transfn */
+		/* add others you make bulk-aware */
+		InvalidOid
+	};
+
+	for (int i = 0; OidIsValid(ok[i]); i++)
+		if (ok[i] == fn_oid)
+			return true;
+	return false;
+}
+
 /*
  * Build transition/combine function invocations for all aggregate transition
  * / combination function invocations in a grouping sets phase. This has to
@@ -3675,13 +3731,17 @@ ExecInitCoerceToDomain(ExprEvalStep *scratch, CoerceToDomain *ctest,
  */
 ExprState *
 ExecBuildAggTrans(AggState *aggstate, AggStatePerPhase phase,
-				  bool doSort, bool doHash, bool nullcheck)
+				  bool doSort, bool doHash, bool nullcheck,
+				  bool *batch_trans)
 {
 	ExprState  *state = makeNode(ExprState);
 	PlanState  *parent = &aggstate->ss.ps;
 	ExprEvalStep scratch = {0};
 	bool		isCombine = DO_AGGSPLIT_COMBINE(aggstate->aggsplit);
 	ExprSetupInfo deform = {0, 0, 0, 0, 0, NIL};
+	bool		batch = AggCanUsePlainBatch(aggstate);
+	Bitmapset  *allattnos = NULL;
+	BatchVector *bv = NULL;
 
 	state->expr = (Expr *) aggstate;
 	state->parent = parent;
@@ -3707,8 +3767,36 @@ ExecBuildAggTrans(AggState *aggstate, AggStatePerPhase phase,
 						  &deform);
 		expr_setup_walker((Node *) pertrans->aggref->aggfilter,
 						  &deform);
+
+		if (!AggTransCanUseBatch(aggstate, pertrans) ||
+			!ExprListAllSimpleVars(pertrans->aggref->args, &allattnos))
+			batch = false;
 	}
-	ExecPushExprSetupSteps(state, &deform);
+
+	if (batch)
+	{
+		if (deform.last_outer > 0)
+		{
+			Assert(!bms_is_empty(allattnos));
+			bv  = BatchVectorCreate(allattnos, deform.last_outer);
+
+			/*
+			 * Deform all tuples upto last_outer in batch
+			 */
+			scratch.opcode = EEOP_OUTER_FETCHSOME_BATCH;
+			scratch.d.fetch_batch.last_var = deform.last_outer;
+			ExprEvalPushStep(state, &scratch);
+
+			/*
+			 * Put all arg Vars into vectors once per batch slice
+			 */
+			scratch.opcode = EEOP_BUILD_OUTER_BATCH_VECTOR;
+			scratch.d.batch_vector.bv = bv;
+			ExprEvalPushStep(state, &scratch);
+		}
+	}
+	else
+		ExecPushExprSetupSteps(state, &deform);
 
 	/*
 	 * Emit instructions for each transition value / grouping set combination.
@@ -3746,7 +3834,7 @@ ExecBuildAggTrans(AggState *aggstate, AggStatePerPhase phase,
 		 * Evaluate arguments to aggregate/combine function.
 		 */
 		argno = 0;
-		if (isCombine)
+		if (isCombine && !batch)
 		{
 			/*
 			 * Combining two aggregate transition values. Instead of directly
@@ -3816,7 +3904,7 @@ ExecBuildAggTrans(AggState *aggstate, AggStatePerPhase phase,
 
 			Assert(pertrans->numInputs == argno);
 		}
-		else if (!pertrans->aggsortrequired)
+		else if (!pertrans->aggsortrequired && !batch)
 		{
 			ListCell   *arg;
 
@@ -3849,7 +3937,7 @@ ExecBuildAggTrans(AggState *aggstate, AggStatePerPhase phase,
 			}
 			Assert(pertrans->numTransInputs == argno);
 		}
-		else if (pertrans->numInputs == 1)
+		else if (pertrans->numInputs == 1 && !batch)
 		{
 			/*
 			 * Non-presorted DISTINCT and/or ORDER BY case, with a single
@@ -3868,7 +3956,7 @@ ExecBuildAggTrans(AggState *aggstate, AggStatePerPhase phase,
 
 			Assert(pertrans->numInputs == argno);
 		}
-		else
+		else if (!batch)
 		{
 			/*
 			 * Non-presorted DISTINCT and/or ORDER BY case, with multiple
@@ -3896,7 +3984,7 @@ ExecBuildAggTrans(AggState *aggstate, AggStatePerPhase phase,
 		 * just keep the prior transValue. This is true for both plain and
 		 * sorted/distinct aggregates.
 		 */
-		if (trans_fcinfo->flinfo->fn_strict && pertrans->numTransInputs > 0)
+		if (trans_fcinfo->flinfo->fn_strict && pertrans->numTransInputs > 0 && !batch)
 		{
 			if (strictnulls)
 				scratch.opcode = EEOP_AGG_STRICT_INPUT_CHECK_NULLS;
@@ -3914,7 +4002,7 @@ ExecBuildAggTrans(AggState *aggstate, AggStatePerPhase phase,
 		}
 
 		/* Handle DISTINCT aggregates which have pre-sorted input */
-		if (pertrans->numDistinctCols > 0 && !pertrans->aggsortrequired)
+		if (pertrans->numDistinctCols > 0 && !pertrans->aggsortrequired && !batch)
 		{
 			if (pertrans->numDistinctCols > 1)
 				scratch.opcode = EEOP_AGG_PRESORTED_DISTINCT_MULTI;
@@ -3942,7 +4030,7 @@ ExecBuildAggTrans(AggState *aggstate, AggStatePerPhase phase,
 			{
 				ExecBuildAggTransCall(state, aggstate, &scratch, trans_fcinfo,
 									  pertrans, transno, setno, setoff, false,
-									  nullcheck);
+									  nullcheck, batch, bv);
 				setoff++;
 			}
 		}
@@ -3962,7 +4050,7 @@ ExecBuildAggTrans(AggState *aggstate, AggStatePerPhase phase,
 			{
 				ExecBuildAggTransCall(state, aggstate, &scratch, trans_fcinfo,
 									  pertrans, transno, setno, setoff, true,
-									  nullcheck);
+									  nullcheck, false, NULL);
 				setoff++;
 			}
 		}
@@ -4007,6 +4095,9 @@ ExecBuildAggTrans(AggState *aggstate, AggStatePerPhase phase,
 
 	ExecReadyExpr(state);
 
+	if (batch_trans)
+		*batch_trans = batch;
+
 	return state;
 }
 
@@ -4020,10 +4111,11 @@ ExecBuildAggTransCall(ExprState *state, AggState *aggstate,
 					  ExprEvalStep *scratch,
 					  FunctionCallInfo fcinfo, AggStatePerTrans pertrans,
 					  int transno, int setno, int setoff, bool ishash,
-					  bool nullcheck)
+					  bool nullcheck, bool batch, BatchVector *bv)
 {
 	ExprContext *aggcontext;
 	int			adjust_jumpnull = -1;
+	BatchVectorSlice *bvs = NULL;
 
 	if (ishash)
 		aggcontext = aggstate->hashcontext;
@@ -4077,7 +4169,16 @@ ExecBuildAggTransCall(ExprState *state, AggState *aggstate,
 	 */
 	if (!pertrans->aggsortrequired)
 	{
-		if (pertrans->transtypeByVal)
+		if (batch)
+		{
+			if (bv)
+				bvs = BatchVectorSliceFromExprArgs(pertrans->aggref->args, bv);
+			if (!AggTransfnSupportsBulk(pertrans->transfn_oid))
+				scratch->opcode = EEOP_AGG_PLAIN_TRANS_BATCH_ROWLOOP;
+			else
+				scratch->opcode = EEOP_AGG_PLAIN_TRANS_BATCH_DIRECT;
+		}
+		else if (pertrans->transtypeByVal)
 		{
 			if (fcinfo->flinfo->fn_strict &&
 				pertrans->initValueIsNull)
@@ -4108,6 +4209,7 @@ ExecBuildAggTransCall(ExprState *state, AggState *aggstate,
 	scratch->d.agg_trans.setoff = setoff;
 	scratch->d.agg_trans.transno = transno;
 	scratch->d.agg_trans.aggcontext = aggcontext;
+	scratch->d.agg_trans.bvs = bvs;
 	ExprEvalPushStep(state, scratch);
 
 	/* fix up jumpnull */
@@ -5069,4 +5171,130 @@ ExecInitJsonCoercion(ExprState *state, JsonReturning *returning,
 	scratch.d.jsonexpr_coercion.exists_check_domain = exists_coerce &&
 		DomainHasConstraints(returning->typid);
 	ExprEvalPushStep(state, &scratch);
+}
+
+/* Is expr a Var node for a non-system attribute? */
+static bool
+expr_is_simple_var(Expr *expr, AttrNumber *out_attno)
+{
+	if (expr == NULL)
+		return false;
+
+	if (IsA(expr, TargetEntry))
+		return expr_is_simple_var((Expr *) ((TargetEntry *) expr)->expr,
+								  out_attno);
+	if (IsA(expr, RelabelType))
+		return expr_is_simple_var((Expr *) ((RelabelType *) expr)->arg,
+								  out_attno);
+
+	if (IsA(expr, Var) && ((Var *) expr)->varattno > 0)
+	{
+		*out_attno = ((Var *) expr)->varattno;
+		return true;
+	}
+
+	return false;
+}
+
+/* Are all inputs plain Vars (optionally allow RelabelType->Var)? Collect attnos. */
+static bool
+ExprListAllSimpleVars(const List *args, Bitmapset **allattnos)
+{
+	ListCell *lc;
+
+	foreach(lc, args)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+		Expr *arg = tle->expr;
+		AttrNumber attno;
+
+		if (!expr_is_simple_var(arg, &attno))
+			return false;
+
+		if (!IsA(arg, Var))
+			return false;
+
+		Assert(attno > 0);
+		*allattnos = bms_add_member(*allattnos, attno);
+	}
+
+	return true;
+}
+
+/* ---------- BatchVector stuff ------------- */
+
+static BatchVector *
+BatchVectorCreate(Bitmapset *attnos, AttrNumber last_var)
+{
+	int maxrows = EXEC_BATCH_ROWS;
+	BatchVector *bv;
+	AttrNumber	attno;
+	int			i;
+
+	bv = palloc(sizeof(BatchVector));
+	bv->ncols = bms_num_members(attnos);
+	bv->maxrows = maxrows;
+	bv->last_var = last_var;
+	bv->attnos = palloc(sizeof(AttrNumber) * bv->ncols);
+	attno = -1;
+	i = 0;
+	while ((attno = bms_next_member(attnos, attno)) > 0)
+		bv->attnos[i++] = attno;
+	bv->cols = palloc(sizeof(Datum *) * bv->ncols);
+	bv->nulls = palloc(sizeof(bool  *) * bv->ncols);
+
+	for (i =0; i < bv->ncols; i++)
+	{
+		bv->cols[i]  = palloc(sizeof(Datum) * maxrows);
+		bv->nulls[i] = palloc(sizeof(bool)  * maxrows);
+	}
+
+	bv->nrows = 0;
+	bv->hasnull = false;
+
+	return bv;
+}
+
+static int16
+BatchVectorFindAttColno(const BatchVector *bv, AttrNumber attno)
+{
+	for (int i = 0; i < bv->ncols; i++)
+		if (bv->attnos[i] == attno)
+			return i;
+
+	return -1;
+}
+
+/*
+ * BatchVectorSliceFromExprArgs
+ *		Build a BatchVectorSlice for a List of args.
+ *
+ * For Var args (possibly under RelabelType), store the col index.
+ * For non-Var args, store -1. Caller can handle Consts, etc.
+ */
+static BatchVectorSlice *
+BatchVectorSliceFromExprArgs(const List *args, const BatchVector *bv)
+{
+	BatchVectorSlice *bvs = palloc(sizeof(BatchVectorSlice));
+	int nargs = list_length(args);
+	int i = 0;
+	ListCell *lc;
+
+	Assert(bv);
+	bvs->bv = bv;
+	bvs->nargs = nargs;
+	bvs->argoffs = (int16 *) palloc(sizeof(int16) * nargs);
+
+	foreach (lc, args)
+	{
+		Expr *arg = (Expr *) lfirst(lc);
+		AttrNumber attno;
+
+		if (expr_is_simple_var(arg, &attno))
+			bvs->argoffs[i++] = BatchVectorFindAttColno(bv, attno);
+		else
+			bvs->argoffs[i++] = -1; /* non-Var */
+	}
+
+	return bvs;
 }
