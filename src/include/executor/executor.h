@@ -326,7 +326,8 @@ extern ExprState *ExecInitQual(List *qual, PlanState *parent);
 extern ExprState *ExecInitCheck(List *qual, PlanState *parent);
 extern List *ExecInitExprList(List *nodes, PlanState *parent);
 extern ExprState *ExecBuildAggTrans(AggState *aggstate, struct AggStatePerPhaseData *phase,
-									bool doSort, bool doHash, bool nullcheck);
+									bool doSort, bool doHash, bool nullcheck,
+									bool *batch_trans);
 extern ExprState *ExecBuildHash32FromAttrs(TupleDesc desc,
 										   const TupleTableSlotOps *ops,
 										   FmgrInfo *hashfunctions,
@@ -547,6 +548,26 @@ ExecQualAndReset(ExprState *state, ExprContext *econtext)
 	/* inline ResetExprContext, to avoid ordering issue in this file */
 	MemoryContextReset(econtext->ecxt_per_tuple_memory);
 	return ret;
+}
+#endif
+
+#ifndef FRONTEND
+/* Per-call bulk argument vectors for batched aggregate trans functions. */
+typedef struct AggBulkArgs
+{
+	int		nrows;		/* number of rows in this batch */
+	int		start_row;
+	int16  *argoffs;
+	int		nargs;		/* number of argument vectors */
+	Datum  **args;		/* args[j][i] = j-th arg at row i */
+	bool   **isnull;	/* isnull[j][i] */
+	bool	hasnull;	/* is any datum in args NULL? */
+} AggBulkArgs;
+
+static inline AggBulkArgs *
+AggGetBulkArgs(FunctionCallInfo fcinfo)
+{
+	return (AggBulkArgs *) (fcinfo->flinfo ? fcinfo->flinfo->fn_extra : NULL);
 }
 #endif
 
