@@ -294,6 +294,7 @@ extern void EvalPlanQualEnd(EPQState *epqstate);
  */
 extern PlanState *ExecInitNode(Plan *node, EState *estate, int eflags);
 extern void ExecSetExecProcNode(PlanState *node, ExecProcNodeMtd function);
+extern void ExecSetExecProcNodeBatch(PlanState *node, ExecProcNodeBatchMtd function);
 extern Node *MultiExecProcNode(PlanState *node);
 extern void ExecEndNode(PlanState *node);
 extern void ExecShutdownNode(PlanState *node);
@@ -314,6 +315,15 @@ ExecProcNode(PlanState *node)
 		ExecReScan(node);		/* let ReScan handle this */
 
 	return node->ExecProcNode(node);
+}
+
+static inline TupleBatch *
+ExecProcNodeBatch(PlanState *node)
+{
+	if (node->chgParam != NULL) /* something changed? */
+		ExecReScan(node);		/* let ReScan handle this */
+
+	return node->ExecProcNodeBatch(node);
 }
 #endif
 
