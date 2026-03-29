@@ -880,6 +880,13 @@
   boot_val => 'true',
 },
 
+{ name => 'executor_batching', type => 'bool', context => 'PGC_USERSET', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'Use tuple batching during execution.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'executor_batching',
+  boot_val => 'true',
+},
+
 { name => 'data_sync_retry', type => 'bool', context => 'PGC_POSTMASTER', group => 'ERROR_HANDLING_OPTIONS',
   short_desc => 'Whether to continue running after a failure to sync data files.',
   variable => 'data_sync_retry',
