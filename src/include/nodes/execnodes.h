@@ -48,6 +48,7 @@
 #include "utils/sortsupport.h"
 #include "utils/tuplesort.h"
 #include "utils/tuplestore.h"
+#include "executor/execBatch.h
 
 /*
  * forward references in this file
@@ -1142,7 +1143,10 @@ typedef struct JsonExprState
  * ----------------
  */
 typedef TupleTableSlot *(*ExecProcNodeMtd) (PlanState *pstate);
-
+/* Return a batch; may reuse caller-provided envelope. NULL => end of scan. */
+struct TupleBatch;
+typedef struct TupleBatch TupleBatch;
+typedef TupleBatch *(*ExecProcNodeBatchMtd)(struct PlanState *ps);
 /* ----------------
  *		PlanState node
  *

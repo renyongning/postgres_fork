@@ -154,3 +154,13 @@ ExecScanReScan(ScanState *node)
 		}
 	}
 }
+bool
+ScanCanUseBatching(ScanState *scanstate, int eflags)
+{
+	Relation	relation = scanstate->ss_currentRelation;
+
+	return	executor_batching &&
+			(scanstate->ps.state->es_epq_active == NULL) &&
+			!(eflags & EXEC_FLAG_BACKWARD) &&
+			relation && table_supports_batching(relation);
+}

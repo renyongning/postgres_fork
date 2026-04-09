@@ -574,6 +574,8 @@ extern Datum ExecMakeFunctionResultSet(SetExprState *fcache,
  * prototypes from functions in execScan.c
  */
 typedef TupleTableSlot *(*ExecScanAccessMtd) (ScanState *node);
+/*scan access method in batch*/
+typedef bool (*ExecScanAccessBatchMtd)(ScanState *node);
 typedef bool (*ExecScanRecheckMtd) (ScanState *node, TupleTableSlot *slot);
 
 extern TupleTableSlot *ExecScan(ScanState *node, ExecScanAccessMtd accessMtd,
@@ -581,7 +583,8 @@ extern TupleTableSlot *ExecScan(ScanState *node, ExecScanAccessMtd accessMtd,
 extern void ExecAssignScanProjectionInfo(ScanState *node);
 extern void ExecAssignScanProjectionInfoWithVarno(ScanState *node, int varno);
 extern void ExecScanReScan(ScanState *node);
-
+extern bool ScanCanUseBatching(ScanState *scanstate, int eflags);
+extern void ScanResetBatching(ScanState *scanstate, bool drop);
 /*
  * prototypes from functions in execTuples.c
  */
