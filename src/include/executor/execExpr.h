@@ -78,6 +78,11 @@ typedef enum ExprEvalOp
 	EEOP_OLD_FETCHSOME,
 	EEOP_NEW_FETCHSOME,
 
+	/* apply slot_getsomeattrs_batch() to corresponding batch */
+	EEOP_INNER_FETCHSOME_BATCH,
+	EEOP_OUTER_FETCHSOME_BATCH,
+	EEOP_SCAN_FETCHSOME_BATCH,
+
 	/* compute non-system Var value */
 	EEOP_INNER_VAR,
 	EEOP_OUTER_VAR,
@@ -292,10 +297,18 @@ typedef enum ExprEvalOp
 	EEOP_AGG_ORDERED_TRANS_DATUM,
 	EEOP_AGG_ORDERED_TRANS_TUPLE,
 
+	/* ExprContext.*_batch -> BatchVector */
+	EEOP_BUILD_INNER_BATCH_VECTOR,
+	EEOP_BUILD_OUTER_BATCH_VECTOR,
+	EEOP_BUILD_SCAN_BATCH_VECTOR,
+
+	/* Batched aggregate trans evaluation */
+	EEOP_AGG_PLAIN_TRANS_BATCH_ROWLOOP,	/* per-row fmgr calls */
+	EEOP_AGG_PLAIN_TRANS_BATCH_DIRECT,	/* call transfn once with AggBulkArgs */
+
 	/* non-existent operation, used e.g. to check array lengths */
 	EEOP_LAST
 } ExprEvalOp;
-
 
 typedef struct ExprEvalStep
 {
@@ -330,6 +343,12 @@ typedef struct ExprEvalStep
 			/* type of slot, can only be relied upon if fixed is set */
 			const TupleTableSlotOps *kind;
 		}			fetch;
+
+		struct
+		{
+			/* attribute number up to which to fetch (inclusive) */
+			int			last_var;
+		}			fetch_batch;
 
 		/* for EEOP_INNER/OUTER/SCAN/OLD/NEW_[SYS]VAR */
 		struct
@@ -735,6 +754,7 @@ typedef struct ExprEvalStep
 
 		/* for EEOP_AGG_PLAIN_TRANS_[INIT_][STRICT_]{BYVAL,BYREF} */
 		/* for EEOP_AGG_ORDERED_TRANS_{DATUM,TUPLE} */
+		/* for EEOP_AGG_PLAIN_TRANS_{BATCH,BATCH_ROWLOOP}*/
 		struct
 		{
 			AggStatePerTrans pertrans;
@@ -742,6 +762,7 @@ typedef struct ExprEvalStep
 			int			setno;
 			int			transno;
 			int			setoff;
+			struct BatchVectorSlice *bvs;
 		}			agg_trans;
 
 		/* for EEOP_IS_JSON */
@@ -769,6 +790,12 @@ typedef struct ExprEvalStep
 			void	   *json_coercion_cache;
 			ErrorSaveContext *escontext;
 		}			jsonexpr_coercion;
+
+		/* for batch vector construction */
+		struct
+		{
+			struct BatchVector *bv;
+		}			batch_vector;
 	}			d;
 } ExprEvalStep;
 
@@ -917,4 +944,35 @@ extern void ExecEvalAggOrderedTransDatum(ExprState *state, ExprEvalStep *op,
 extern void ExecEvalAggOrderedTransTuple(ExprState *state, ExprEvalStep *op,
 										 ExprContext *econtext);
 
+/* ---------- BatchVector stuff ------------- */
+
+/* Vector fetch spec for a list of simple Vars. */
+typedef struct BatchVector
+{
+	/* immutable after BatchVectorCreate */
+	AttrNumber *attnos;		/* [ncols] */
+	int			ncols;
+	int			maxrows;
+	int			last_var;
+
+	/* per batch state */
+	Datum **cols;			/* [ncols][maxbatch] */
+	bool  **nulls;			/* [ncols][maxbatch] */
+	bool	hasnull;		/* is any datum in cols NULL? */
+	int		nrows;			/* #rows loaded into cols/nulls */
+} BatchVector;
+
+/* A slice of BatchVector that maps caller args to BatchVector columns. */
+typedef struct BatchVectorSlice
+{
+	const BatchVector *bv;
+	int			nargs;		/* number of args covered */
+	int16	   *argoffs;	/* length nargs, -1 for non-Var entries */
+} BatchVectorSlice;
+
+extern void ExecBuildInnerBatchVector(ExprState *state, ExprEvalStep *op, ExprContext *econtext);
+extern void ExecBuildOuterBatchVector(ExprState *state, ExprEvalStep *op, ExprContext *econtext);
+extern void ExecBuildScanBatchVector(ExprState *state, ExprEvalStep *op, ExprContext *econtext);
+
+extern void ExecAggPlainTransBatch(ExprState *state, ExprEvalStep *op, ExprContext *econtext);
 #endif							/* EXEC_EXPR_H */

@@ -277,6 +277,14 @@ typedef struct ExprContext
 #define FIELDNO_EXPRCONTEXT_OUTERTUPLE 3
 	TupleTableSlot *ecxt_outertuple;
 
+	/* For batched evaluation using batch-aware EEOPs */
+#define FIELDNO_EXPRCONTEXT_INNERBATCH 4
+	TupleBatch	   *inner_batch;
+#define FIELDNO_EXPRCONTEXT_OUTERBATCH 5
+	TupleBatch	   *outer_batch;
+#define FIELDNO_EXPRCONTEXT_SCANBATCH 6
+	TupleBatch	   *scan_batch;
+
 	/* Memory contexts for expression evaluation --- see notes above */
 	MemoryContext ecxt_per_query_memory;
 	MemoryContext ecxt_per_tuple_memory;
@@ -289,27 +297,27 @@ typedef struct ExprContext
 	 * Values to substitute for Aggref nodes in the expressions of an Agg
 	 * node, or for WindowFunc nodes within a WindowAgg node.
 	 */
-#define FIELDNO_EXPRCONTEXT_AGGVALUES 8
+#define FIELDNO_EXPRCONTEXT_AGGVALUES 11
 	Datum	   *ecxt_aggvalues; /* precomputed values for aggs/windowfuncs */
-#define FIELDNO_EXPRCONTEXT_AGGNULLS 9
+#define FIELDNO_EXPRCONTEXT_AGGNULLS 12
 	bool	   *ecxt_aggnulls;	/* null flags for aggs/windowfuncs */
 
 	/* Value to substitute for CaseTestExpr nodes in expression */
-#define FIELDNO_EXPRCONTEXT_CASEDATUM 10
+#define FIELDNO_EXPRCONTEXT_CASEDATUM 13
 	Datum		caseValue_datum;
-#define FIELDNO_EXPRCONTEXT_CASENULL 11
+#define FIELDNO_EXPRCONTEXT_CASENULL 14
 	bool		caseValue_isNull;
 
 	/* Value to substitute for CoerceToDomainValue nodes in expression */
-#define FIELDNO_EXPRCONTEXT_DOMAINDATUM 12
+#define FIELDNO_EXPRCONTEXT_DOMAINDATUM 15
 	Datum		domainValue_datum;
-#define FIELDNO_EXPRCONTEXT_DOMAINNULL 13
+#define FIELDNO_EXPRCONTEXT_DOMAINNULL 16
 	bool		domainValue_isNull;
 
 	/* Tuples that OLD/NEW Var nodes in RETURNING may refer to */
-#define FIELDNO_EXPRCONTEXT_OLDTUPLE 14
+#define FIELDNO_EXPRCONTEXT_OLDTUPLE 17
 	TupleTableSlot *ecxt_oldtuple;
-#define FIELDNO_EXPRCONTEXT_NEWTUPLE 15
+#define FIELDNO_EXPRCONTEXT_NEWTUPLE 18
 	TupleTableSlot *ecxt_newtuple;
 
 	/* Link to containing EState (NULL if a standalone ExprContext) */
@@ -1147,6 +1155,7 @@ typedef TupleTableSlot *(*ExecProcNodeMtd) (PlanState *pstate);
 /* Return a batch; may reuse caller-provided envelope. NULL => end of scan. */
 struct TupleBatch;
 typedef struct TupleBatch TupleBatch;
+typedef TupleBatch *(*ExecProcNodeBatchMtd)(struct PlanState *ps);
 
 /* ----------------
  *		PlanState node
@@ -1170,6 +1179,10 @@ typedef struct PlanState
 	ExecProcNodeMtd ExecProcNode;	/* function to return next tuple */
 	ExecProcNodeMtd ExecProcNodeReal;	/* actual function, if above is a
 										 * wrapper */
+
+	/* Optional batch-producing entry point (NULL => no batching). */
+	ExecProcNodeBatchMtd ExecProcNodeBatch;
+	ExecProcNodeBatchMtd ExecProcNodeBatchReal;
 
 	Instrumentation *instrument;	/* Optional runtime stats for this node */
 	WorkerInstrumentation *worker_instrument;	/* per-worker instrumentation */
@@ -2530,6 +2543,9 @@ typedef struct AggStatePerGroupData *AggStatePerGroup;
 typedef struct AggStatePerPhaseData *AggStatePerPhase;
 typedef struct AggStatePerHashData *AggStatePerHash;
 
+struct AggState;
+typedef TupleTableSlot *(*AggRetrievePlainFn)(struct AggState *);
+
 typedef struct AggState
 {
 	ScanState	ss;				/* its first field is NodeTag */
@@ -2605,6 +2621,8 @@ typedef struct AggState
 	AggStatePerGroup *all_pergroups;	/* array of first ->pergroups, than
 										 * ->hash_pergroup */
 	SharedAggInfo *shared_info; /* one entry per worker */
+
+	AggRetrievePlainFn retrieve_plain; /* init-time choice */
 } AggState;
 
 /* ----------------
