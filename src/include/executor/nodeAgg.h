@@ -289,6 +289,7 @@ typedef struct AggStatePerPhaseData
 	Sort	   *sortnode;		/* Sort node for input ordering for phase */
 
 	ExprState  *evaltrans;		/* evaluation of transition functions  */
+	bool		batch_trans;	/* true if evaltrans contains batch EEOPs */
 
 	/*----------
 	 * Cached variants of the compiled expression.
@@ -337,5 +338,6 @@ extern void ExecAggEstimate(AggState *node, ParallelContext *pcxt);
 extern void ExecAggInitializeDSM(AggState *node, ParallelContext *pcxt);
 extern void ExecAggInitializeWorker(AggState *node, ParallelWorkerContext *pwcxt);
 extern void ExecAggRetrieveInstrumentation(AggState *node);
+extern bool AggCanUsePlainBatch(AggState *aggstate);
 
 #endif							/* NODEAGG_H */

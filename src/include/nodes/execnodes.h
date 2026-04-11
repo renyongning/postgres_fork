@@ -30,6 +30,7 @@
 #define EXECNODES_H
 
 #include "access/tupconvert.h"
+#include "executor/execBatch.h"
 #include "executor/instrument.h"
 #include "fmgr.h"
 #include "lib/ilist.h"
@@ -1143,6 +1144,11 @@ typedef struct JsonExprState
  */
 typedef TupleTableSlot *(*ExecProcNodeMtd) (PlanState *pstate);
 
+/* Return a batch; may reuse caller-provided envelope. NULL => end of scan. */
+struct TupleBatch;
+typedef struct TupleBatch TupleBatch;
+typedef TupleBatch *(*ExecProcNodeBatchMtd)(struct PlanState *ps);
+
 /* ----------------
  *		PlanState node
  *
@@ -1165,6 +1171,10 @@ typedef struct PlanState
 	ExecProcNodeMtd ExecProcNode;	/* function to return next tuple */
 	ExecProcNodeMtd ExecProcNodeReal;	/* actual function, if above is a
 										 * wrapper */
+
+	/* Optional batch-producing entry point (NULL => no batching). */
+	ExecProcNodeBatchMtd ExecProcNodeBatch;
+	ExecProcNodeBatchMtd ExecProcNodeBatchReal;
 
 	Instrumentation *instrument;	/* Optional runtime stats for this node */
 	WorkerInstrumentation *worker_instrument;	/* per-worker instrumentation */
@@ -1197,6 +1207,9 @@ typedef struct PlanState
 	TupleTableSlot *ps_ResultTupleSlot; /* slot for my result tuples */
 	ExprContext *ps_ExprContext;	/* node's expression-evaluation context */
 	ProjectionInfo *ps_ProjInfo;	/* info for doing tuple projection */
+
+	/* Batching state if node supports it. */
+	TupleBatch *ps_Batch;
 
 	bool		async_capable;	/* true if node is async-capable */
 
@@ -2522,6 +2535,9 @@ typedef struct AggStatePerGroupData *AggStatePerGroup;
 typedef struct AggStatePerPhaseData *AggStatePerPhase;
 typedef struct AggStatePerHashData *AggStatePerHash;
 
+struct AggState;
+typedef TupleTableSlot *(*AggRetrievePlainFn)(struct AggState *);
+
 typedef struct AggState
 {
 	ScanState	ss;				/* its first field is NodeTag */
@@ -2597,6 +2613,8 @@ typedef struct AggState
 	AggStatePerGroup *all_pergroups;	/* array of first ->pergroups, than
 										 * ->hash_pergroup */
 	SharedAggInfo *shared_info; /* one entry per worker */
+
+	AggRetrievePlainFn retrieve_plain; /* init-time choice */
 } AggState;
 
 /* ----------------

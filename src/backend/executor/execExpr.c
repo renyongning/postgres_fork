@@ -103,8 +103,9 @@ static void ExecInitJsonCoercion(ExprState *state, JsonReturning *returning,
 								 ErrorSaveContext *escontext, bool omit_quotes,
 								 bool exists_coerce,
 								 Datum *resv, bool *resnull);
-
-
+static BatchVector *BatchVectorCreate(Bitmapset *attnos, AttrNumber last_var);
+static bool ExprListAllSimpleVars(const List *args, Bitmapset **allattnos);
+static BatchVectorSlice *BatchVectorSliceFromExprArgs(const List *args,const BatchVector *bv);
 /*
  * ExecInitExpr: prepare an expression tree for execution
  *
@@ -5069,4 +5070,51 @@ ExecInitJsonCoercion(ExprState *state, JsonReturning *returning,
 	scratch.d.jsonexpr_coercion.exists_check_domain = exists_coerce &&
 		DomainHasConstraints(returning->typid);
 	ExprEvalPushStep(state, &scratch);
+}
+/* Is expr a Var node for a non-system attribute? */
+static bool
+expr_is_simple_var(Expr *expr, AttrNumber *out_attno)
+{
+	if (expr == NULL)
+		return false;
+
+	if (IsA(expr, TargetEntry))
+		return expr_is_simple_var((Expr *) ((TargetEntry *) expr)->expr,
+								  out_attno);
+	if (IsA(expr, RelabelType))
+		return expr_is_simple_var((Expr *) ((RelabelType *) expr)->arg,
+								  out_attno);
+
+	if (IsA(expr, Var) && ((Var *) expr)->varattno > 0)
+	{
+		*out_attno = ((Var *) expr)->varattno;
+		return true;
+	}
+
+	return false;
+}
+
+/* Are all inputs plain Vars (optionally allow RelabelType->Var)? Collect attnos. */
+static bool
+ExprListAllSimpleVars(const List *args, Bitmapset **allattnos)
+{
+	ListCell *lc;
+
+	foreach(lc, args)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+		Expr *arg = tle->expr;
+		AttrNumber attno;
+
+		if (!expr_is_simple_var(arg, &attno))
+			return false;
+
+		if (!IsA(arg, Var))
+			return false;
+
+		Assert(attno > 0);
+		*allattnos = bms_add_member(*allattnos, attno);
+	}
+
+	return true;
 }

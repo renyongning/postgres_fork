@@ -243,4 +243,108 @@ ExecScanExtended(ScanState *node,
 	}
 }
 
+static inline TupleTableSlot *
+ExecScanExtendedBatchSlot(ScanState *node,
+						  ExecScanAccessBatchMtd accessBatchMtd,
+						  ExprState *qual, ProjectionInfo *projInfo)
+{
+	ExprContext *econtext = node->ps.ps_ExprContext;
+	TupleBatch *b = node->ps.ps_Batch;
+
+	/* Batch path does not support EPQ */
+	Assert(node->ps.state->es_epq_active == NULL);
+	Assert(TupleBatchIsValid(b));
+
+	for (;;)
+	{
+		TupleTableSlot *in;
+
+		CHECK_FOR_INTERRUPTS();
+
+		/* Get next input slot from current batch, or refill */
+		if (!TupleBatchHasMore(b))
+		{
+			if (!accessBatchMtd(node))
+				return NULL;
+		}
+
+		in = TupleBatchGetNextSlot(b);
+		Assert(in);
+
+		/* No qual, no projection: direct return */
+		if (qual == NULL && projInfo == NULL)
+			return in;
+
+		ResetExprContext(econtext);
+		econtext->ecxt_scantuple = in;
+
+		/* Qual only */
+		if (projInfo == NULL)
+		{
+			if (qual == NULL || ExecQual(qual, econtext))
+				return in;
+			else
+				InstrCountFiltered1(node, 1);
+			continue;
+		}
+
+		/* Projection (with or without qual) */
+		if (qual == NULL || ExecQual(qual, econtext))
+			return ExecProject(projInfo);
+		else
+			InstrCountFiltered1(node, 1);
+		/* else try next tuple */
+	}
+}
+
+static inline TupleBatch *
+ExecScanExtendedBatch(ScanState *node,
+					  ExecScanAccessBatchMtd accessBatchMtd,
+					  ExprState *qual, ProjectionInfo *projInfo)
+{
+	ExprContext *econtext = node->ps.ps_ExprContext;
+	TupleBatch *b = node->ps.ps_Batch;
+	int			qualified;
+
+	/* Batch path does not support EPQ */
+	Assert(node->ps.state->es_epq_active == NULL);
+	Assert(TupleBatchIsValid(b));
+
+	for (;;)
+	{
+		CHECK_FOR_INTERRUPTS();
+
+		/* Get next batch from the AM */
+		if (!accessBatchMtd(node))
+			return NULL;
+
+		if (qual != NULL)
+		{
+			qualified = 0;
+			while (TupleBatchHasMore(b))
+			{
+				TupleTableSlot *in = TupleBatchGetNextSlot(b);
+
+				Assert(in);
+				ResetExprContext(econtext);
+				econtext->ecxt_scantuple = in;
+
+				if (ExecQual(qual, econtext))
+				{
+					TupleBatchStoreInOut(b, qualified, in);
+					qualified++;
+				}
+				else
+					InstrCountFiltered1(node, 1);
+			}
+			TupleBatchUseOutput(b, qualified);
+		}
+		else
+			qualified = b->nvalid;
+
+		if (qualified > 0)
+			return b;
+		/* else get the next batch from the AM */
+	}
+}
 #endif							/* EXECSCAN_H */

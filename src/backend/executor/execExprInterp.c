@@ -79,7 +79,7 @@
 #include "utils/timestamp.h"
 #include "utils/typcache.h"
 #include "utils/xml.h"
-
+#include "executor/execBatch.h"
 /*
  * Use computed-goto-based opcode dispatch when computed gotos are available.
  * But use a separate symbol so that it's easy to adjust locally in this file
@@ -187,7 +187,10 @@ static pg_attribute_always_inline void ExecAggPlainTransByRef(AggState *aggstate
 															  ExprContext *aggcontext,
 															  int setno);
 static char *ExecGetJsonValueItemString(JsonbValue *item, bool *resnull);
-
+static pg_attribute_always_inline void ExecBuildBatchVector(ExprState *state,
+																ExprEvalStep *op,
+																ExprContext *econtext,
+																TupleBatch *b);
 /*
  * ScalarArrayOpExprHashEntry
  * 		Hash table entry type used during EEOP_HASHED_SCALARARRAYOP
@@ -466,6 +469,10 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 	TupleTableSlot *scanslot;
 	TupleTableSlot *oldslot;
 	TupleTableSlot *newslot;
+	/*for batch expr*/
+	TupleBatch *innerbatch;
+	TupleBatch *outerbatch;
+	TupleBatch *scanbatch;
 
 	/*
 	 * This array has to be in the same order as enum ExprEvalOp.
@@ -612,6 +619,9 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 	scanslot = econtext->ecxt_scantuple;
 	oldslot = econtext->ecxt_oldtuple;
 	newslot = econtext->ecxt_newtuple;
+	innerbatch = econtext->inner_batch;
+    outerbatch = econtext->outer_batch;
+    scanbatch = econtext->scan_batch;
 
 #if defined(EEO_USE_COMPUTED_GOTO)
 	EEO_DISPATCH();
