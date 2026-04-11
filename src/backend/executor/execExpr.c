@@ -5229,6 +5229,132 @@ ExprListAllSimpleVars(const List *args, Bitmapset **allattnos)
 
 	return true;
 }
+/* helper: extract Var (allowing RelabelType->Var); returns NULL if not */
+static Var *
+strip_to_var(Node *n)
+{
+	if (n == NULL)
+		return NULL;
+	if (IsA(n, RelabelType))
+		n = (Node *) ((RelabelType *) n)->arg;
+	if (!IsA(n, Var))
+		return NULL;
+	if (((Var *) n)->varattno < 0)
+		return NULL;
+	return (Var *) n;
+}
+
+/* main walker; return true to abort traversal early, false to continue */
+static bool
+qual_batchable_walker(Node *node, void *context)
+{
+	QualBatchContext *cxt = (QualBatchContext *) context;
+
+	if (node == NULL || !cxt->ok)
+		return false;
+
+	switch (nodeTag(node))
+	{
+		case T_List:
+			return expression_tree_walker(node, qual_batchable_walker, cxt);
+
+		case T_BoolExpr:
+		{
+			BoolExpr *b = (BoolExpr *) node;
+
+			/* Only AND trees are allowed */
+			if (b->boolop != AND_EXPR)
+			{
+				cxt->ok = false;
+				return true; /* abort */
+			}
+			/* Recurse normally over children */
+			return expression_tree_walker(node, qual_batchable_walker, cxt);
+		}
+
+		case T_NullTest:
+		{
+			NullTest *nt = (NullTest *) node;
+			Var		 *v  = strip_to_var((Node *) nt->arg);
+
+			if (v == NULL)
+			{
+				cxt->ok = false;
+				return true;
+			}
+
+			cxt->attnos = bms_add_member(cxt->attnos, v->varattno);
+			if (v->varattno > cxt->last_scan)
+				cxt->last_scan = v->varattno;
+			cxt->leaves = lappend(cxt->leaves, node);
+
+			/* Do NOT recurse into leaf */
+			return false;
+		}
+
+		case T_OpExpr:
+		{
+			OpExpr *op = (OpExpr *) node;
+			List   *args = op->args;
+			Node   *l, *r;
+			Var    *lv,
+				   *rv = NULL;
+
+			/* binary only */
+			if (list_length(args) != 2)
+			{
+				cxt->ok = false;
+				return true;
+			}
+			/* strict operator only (NULL -> false semantics) */
+			if (!func_strict(op->opfuncid))
+			{
+				cxt->ok = false;
+				return true;
+			}
+
+			l = linitial(args);
+			r = lsecond(args);
+			lv = strip_to_var(l);
+			if (lv == NULL)
+			{
+				cxt->ok = false;
+				return true;
+			}
+			cxt->attnos = bms_add_member(cxt->attnos, lv->varattno);
+			if (lv->varattno > cxt->last_scan)
+				cxt->last_scan = lv->varattno;
+
+			if (IsA(r, Const))
+			{
+				/* ok; no attno to add */
+			}
+			else
+			{
+				rv = strip_to_var(r);
+				if (rv == NULL)
+				{
+					cxt->ok = false;
+					return true;
+				}
+				cxt->attnos = bms_add_member(cxt->attnos, rv->varattno);
+				if (rv->varattno > cxt->last_scan)
+					cxt->last_scan = rv->varattno;
+			}
+			cxt->leaves = lappend(cxt->leaves, node);
+
+			/* Leaf handled; do NOT recurse into args */
+			return false;
+		}
+
+		/* Whitelist ends here; anything else in the tree rejects */
+		default:
+			cxt->ok = false;
+			break;
+	}
+
+	return true;
+}
 
 /* ---------- BatchVector stuff ------------- */
 
@@ -5320,4 +5446,19 @@ strip_to_var(Node *n)
 	if (((Var *) n)->varattno < 0)
 		return NULL;
 	return (Var *) n;
+}
+/*
+ * BatchVectorOffsetForVarExpr
+ *   Map a Var (or RelabelType->Var) to its BatchVector column index.
+ *   Returns -1 if the Var’s attno is not present.
+ */
+static int16
+BatchVectorOffsetForVarExpr(Expr *expr, const BatchVector *bv)
+{
+	AttrNumber attno;
+
+	if (!expr_is_simple_var(expr, &attno))
+		return -1;
+
+	return (int16) BatchVectorFindAttColno(bv, attno);
 }

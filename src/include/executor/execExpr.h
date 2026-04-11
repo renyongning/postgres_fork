@@ -975,4 +975,36 @@ extern void ExecBuildOuterBatchVector(ExprState *state, ExprEvalStep *op, ExprCo
 extern void ExecBuildScanBatchVector(ExprState *state, ExprEvalStep *op, ExprContext *econtext);
 
 extern void ExecAggPlainTransBatch(ExprState *state, ExprEvalStep *op, ExprContext *econtext);
+typedef enum BatchQualTermKind
+{
+	BQTK_VAR_CONST,
+	BQTK_VAR_VAR,
+	BQTK_IS_NULL,
+	BQTK_IS_NOT_NULL,
+} BatchQualTermKind;
+
+typedef struct BatchQualTerm
+{
+	BatchQualTermKind kind;
+	bool		strict;		/* follow strict NULL semantics if true */
+	int16		l_off;		/* left VAR column (index into BatchVector) */
+	int16		r_off;		/* right VAR column, or -1 if Const */
+	Datum		r_const;	/* for VAR_CONST */
+	bool		r_isnull;	/* for VAR_CONST */
+	FmgrInfo   *finfo;		/* fmgr for generic binary ops */
+	Oid			collation;	/* op collation */
+} BatchQualTerm;
+
+/*
++ * Runtime view for batched qual programs.
++ * Owned by the ExprState; lifetime == ExprState.
++ */
+typedef struct BatchQualRuntime
+{
+	uint64 *mask;
+	int		mask_words;
+} BatchQualRuntime;
+
+extern void ExecQualBatchInitMask(ExprState *state, ExprEvalStep *op, ExprContext *econtext);
+extern void ExecQualBatchTerm(ExprState *state, ExprEvalStep *op, ExprContext *econtext);
 #endif							/* EXEC_EXPR_H */

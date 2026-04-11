@@ -6185,3 +6185,34 @@ ExecAggPlainTransBatch(ExprState *state, ExprEvalStep *op, ExprContext *econtext
 			elog(ERROR, "invalid ExprEvalOp in ExecAggPlainTransBatch()");
 	}
 }
+
+/* set mask bits [0..nvalid_bits) to 1; clear padding in the last word */
+static inline void
+mask_init_all_ones(uint64 *a, int nwords, int nvalid_bits)
+{
+	for (int i = 0; i < nwords; i++)
+		a[i] = ~UINT64CONST(0);
+
+	if ((nvalid_bits & 63) != 0)
+	{
+		int rem = nvalid_bits & 63;
+
+		a[nwords - 1] &= (~UINT64CONST(0)) >> (64 - rem);
+	}
+}
+
+static inline void
+mask_clear_bit(uint64 *a, int i)
+{
+	a[i >> 6] &= ~(UINT64CONST(1) << (i & 63));
+}
+static inline bool
+mask_is_empty(const uint64 *mask, int nwords)
+{
+	for (int i = 0; i < nwords; i++)
+	{
+		if (mask[i] != 0)
+			return false;
+	}
+	return true;
+}
